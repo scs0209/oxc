@@ -143,7 +143,7 @@ impl<'c> StandaloneAttachmentCollector<'c> {
     }
 
     fn finish(self) -> CommentAttachments {
-        self.collector.finish()
+        self.collector.finish(self.node_count as usize)
     }
 }
 
@@ -157,8 +157,8 @@ impl<'a> Visit<'a> for StandaloneAttachmentCollector<'_> {
     }
 
     #[inline]
-    fn leave_node(&mut self, kind: AstKind<'a>) {
-        self.collector.leave_node(kind);
+    fn leave_node(&mut self, _: AstKind<'a>) {
+        self.collector.leave_node();
     }
 }
 
@@ -170,35 +170,46 @@ impl<'a> Visit<'a> for StandaloneAttachmentCollector<'_> {
 #[doc(hidden)]
 pub struct CommentAttachmentCollector<'c> {
     comments: &'c [Comment],
-    node_count: usize,
+    #[cfg(debug_assertions)]
+    next_node_id: usize,
+    depth: usize,
     relevant_nodes: Vec<RelevantNode>,
-    stack: Vec<Option<usize>>,
+    relevant_stack: Vec<(usize, usize)>,
 }
 
 impl<'c> CommentAttachmentCollector<'c> {
     /// Create a collector for parser-produced `comments`.
     pub fn new(comments: &'c [Comment]) -> Self {
         debug_assert!(comments.windows(2).all(|pair| pair[0].span.end <= pair[1].span.start));
-        Self { comments, node_count: 0, relevant_nodes: Vec::new(), stack: Vec::new() }
+        Self {
+            comments,
+            #[cfg(debug_assertions)]
+            next_node_id: 0,
+            depth: 0,
+            relevant_nodes: Vec::new(),
+            relevant_stack: Vec::new(),
+        }
     }
 
     /// Record entry into a node after its dense [`NodeId`] has been assigned.
     pub fn enter_node(&mut self, kind: AstKind<'_>) {
         let node_id = kind.node_id();
-        debug_assert_eq!(node_id.index(), self.node_count);
-        self.node_count += 1;
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(node_id.index(), self.next_node_id);
+            self.next_node_id += 1;
+        }
 
-        let span = kind.span();
         let comment_range = if node_id == NodeId::ROOT {
             0..self.comments.len()
-        } else if let Some(Some(parent_index)) = self.stack.last().copied() {
-            self.relevant_nodes[parent_index].record_child(node_id, span, self.comments)
+        } else if let Some(&(parent_index, parent_depth)) = self.relevant_stack.last()
+            && parent_depth + 1 == self.depth
+        {
+            self.relevant_nodes[parent_index].record_child(node_id, kind.span(), self.comments)
         } else {
             0..0
         };
-        let relevant_index = if comment_range.is_empty() {
-            None
-        } else {
+        if !comment_range.is_empty() {
             let index = self.relevant_nodes.len();
             self.relevant_nodes.push(RelevantNode {
                 node_id,
@@ -208,21 +219,22 @@ impl<'c> CommentAttachmentCollector<'c> {
                 has_children: false,
                 boundaries: None,
             });
-            Some(index)
-        };
-        self.stack.push(relevant_index);
+            self.relevant_stack.push((index, self.depth));
+        }
+        self.depth += 1;
     }
 
     /// Record exit from a node.
-    pub fn leave_node(&mut self, kind: AstKind<'_>) {
-        let Some(relevant_index) = self.stack.pop() else {
+    pub fn leave_node(&mut self) {
+        let Some(depth) = self.depth.checked_sub(1) else {
             debug_assert!(false, "node stack must be balanced");
             return;
         };
-        debug_assert!(
-            relevant_index
-                .is_none_or(|index| { self.relevant_nodes[index].node_id == kind.node_id() })
-        );
+        self.depth = depth;
+        if self.relevant_stack.last().is_some_and(|&(_, node_depth)| node_depth == depth) {
+            let popped = self.relevant_stack.pop();
+            debug_assert!(popped.is_some(), "relevant node stack must be balanced");
+        }
     }
 
     /// Finish collection and assign exactly one owner to every comment.
@@ -231,9 +243,12 @@ impl<'c> CommentAttachmentCollector<'c> {
     ///
     /// Panics if the recorded AST structure cannot provide an owner for every
     /// parser-produced comment.
-    pub fn finish(self) -> CommentAttachments {
-        debug_assert!(self.stack.is_empty());
-        debug_assert!(self.node_count > 0);
+    pub fn finish(self, node_count: usize) -> CommentAttachments {
+        debug_assert_eq!(self.depth, 0);
+        debug_assert!(self.relevant_stack.is_empty());
+        debug_assert!(node_count > 0);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(node_count, self.next_node_id);
 
         let mut assignments = vec![None; self.comments.len()];
         assign_comments(self.comments, &self.relevant_nodes, &mut assignments);
@@ -259,7 +274,7 @@ impl<'c> CommentAttachmentCollector<'c> {
         let mut host_presence = if grouped.is_empty() {
             Vec::new()
         } else {
-            vec![0_u64; self.node_count.div_ceil(u64::BITS as usize)]
+            vec![0_u64; node_count.div_ceil(u64::BITS as usize)]
         };
         let mut hosts = Vec::new();
         let mut comments = Vec::with_capacity(grouped.len());
@@ -283,7 +298,7 @@ impl<'c> CommentAttachmentCollector<'c> {
         }
 
         CommentAttachments {
-            node_count: self.node_count,
+            node_count,
             host_presence: host_presence.into_boxed_slice(),
             hosts: hosts.into_boxed_slice(),
             comments: comments.into_boxed_slice(),

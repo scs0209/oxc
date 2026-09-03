@@ -399,7 +399,7 @@ impl<'a> SemanticBuilder<'a> {
         let comment_attachments = if self.build_comment_attachments {
             Some(self.comment_attachment_collector.map_or_else(
                 || CommentAttachments::empty(node_count as usize),
-                CommentAttachmentCollector::finish,
+                |collector| collector.finish(node_count as usize),
             ))
         } else {
             None
@@ -904,7 +904,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     #[inline(always)]
     fn leave_node(&mut self, kind: AstKind<'a>) {
         if let Some(collector) = &mut self.comment_attachment_collector {
-            collector.leave_node(kind);
+            collector.leave_node();
         }
         if self.check_syntax_error {
             checker::check(kind, self);
