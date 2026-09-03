@@ -1,16 +1,11 @@
 use std::cell::Cell;
 
 use oxc_ast::{
-    AstKind, Comment,
+    AstKind,
     ast::{BindingIdentifier, IdentifierReference, Program, TSEnumMemberName},
 };
-use oxc_ast_visit::{
-    CommentAttachmentCollector, CommentAttachments, Visit, walk::walk_ts_enum_member_name,
-};
-use oxc_syntax::{
-    node::NodeId,
-    scope::{ScopeFlags, ScopeId},
-};
+use oxc_ast_visit::{Visit, walk::walk_ts_enum_member_name};
+use oxc_syntax::scope::{ScopeFlags, ScopeId};
 
 /// Macro to assert that `left >= right`
 macro_rules! assert_ge {
@@ -99,15 +94,6 @@ impl Stats {
         counter.stats
     }
 
-    pub(crate) fn count_with_comment_attachments<'a>(
-        program: &'a Program<'a>,
-    ) -> (Self, CommentAttachments) {
-        let mut counter = AttachmentCounter::new(&program.comments);
-        counter.visit_program(program);
-        let attachments = counter.collector.finish();
-        (counter.stats, attachments)
-    }
-
     /// Increase scope, symbol, and reference counts by provided `excess`.
     ///
     /// `excess` is provided as a fraction.
@@ -174,69 +160,6 @@ impl<'a> Visit<'a> for Counter {
     fn visit_identifier_reference(&mut self, _: &IdentifierReference<'a>) {
         self.stats.nodes += 1;
         self.stats.references += 1;
-    }
-
-    #[inline]
-    fn visit_ts_enum_member_name(&mut self, it: &TSEnumMemberName<'a>) {
-        self.stats.symbols += 1;
-        walk_ts_enum_member_name(self, it);
-    }
-}
-
-struct AttachmentCounter<'a> {
-    stats: Stats,
-    collector: CommentAttachmentCollector<'a>,
-}
-
-impl<'a> AttachmentCounter<'a> {
-    fn new(comments: &'a [Comment]) -> Self {
-        Self { stats: Stats::default(), collector: CommentAttachmentCollector::new(comments) }
-    }
-
-    #[inline]
-    fn enter_ast_node(&mut self, kind: AstKind<'a>) {
-        let node_id = NodeId::new(self.stats.nodes as usize);
-        self.stats.nodes += 1;
-        self.collector.enter_node_with_id(kind, node_id);
-    }
-
-    #[inline]
-    fn leave_ast_node(&mut self) {
-        self.collector.leave_node();
-    }
-}
-
-/// Visitor which combines the semantic sizing prepass with comment attachment.
-impl<'a> Visit<'a> for AttachmentCounter<'a> {
-    #[inline]
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        self.enter_ast_node(kind);
-    }
-
-    #[inline]
-    fn leave_node(&mut self, _: AstKind<'a>) {
-        self.leave_ast_node();
-    }
-
-    #[inline]
-    fn enter_scope(&mut self, _: ScopeFlags, _: &Cell<Option<ScopeId>>) {
-        self.stats.scopes += 1;
-    }
-
-    #[inline]
-    fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
-        let kind = AstKind::BindingIdentifier(self.alloc(it));
-        self.enter_ast_node(kind);
-        self.stats.symbols += 1;
-        self.leave_ast_node();
-    }
-
-    #[inline]
-    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
-        let kind = AstKind::IdentifierReference(self.alloc(it));
-        self.enter_ast_node(kind);
-        self.stats.references += 1;
-        self.leave_ast_node();
     }
 
     #[inline]

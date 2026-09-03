@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 
 use oxc_allocator::{Address, ArenaVec};
 use oxc_ast::{AstKind, ast::*};
-use oxc_ast_visit::{CommentAttachmentBuilder, CommentAttachments, Visit};
+use oxc_ast_visit::{CommentAttachmentCollector, CommentAttachments, Visit};
 #[cfg(feature = "cfg")]
 use oxc_cfg::{
     ControlFlowGraphBuilder, CtxCursor, CtxFlags, EdgeType, ErrorEdgeKind, InstructionKind,
@@ -106,6 +106,7 @@ pub struct SemanticBuilder<'a> {
 
     /// Whether to collect the separate comment-attachment sidecar during traversal.
     build_comment_attachments: bool,
+    comment_attachment_collector: Option<CommentAttachmentCollector<'a>>,
 
     /// Should enum member values be evaluated?
     enum_eval: bool,
@@ -168,6 +169,7 @@ impl<'a> SemanticBuilder<'a> {
             stats: None,
             excess_capacity: 0.0,
             build_comment_attachments: false,
+            comment_attachment_collector: None,
             enum_eval: false,
             check_syntax_error: false,
             #[cfg(feature = "cfg")]
@@ -325,6 +327,10 @@ impl<'a> SemanticBuilder<'a> {
     pub fn build(mut self, program: &'a Program<'a>) -> SemanticBuilderReturn<'a> {
         self.source_text = program.source_text;
         self.source_type = program.source_type;
+        if self.build_comment_attachments && !program.comments.is_empty() {
+            self.comment_attachment_collector =
+                Some(CommentAttachmentCollector::new(&program.comments));
+        }
         #[cfg(feature = "jsdoc")]
         {
             self.jsdoc = JSDocBuilder::new(self.source_text, &program.comments);
@@ -342,28 +348,12 @@ impl<'a> SemanticBuilder<'a> {
         //
         // If user did not provide existing `Stats`, calculate them by visiting AST.
         #[cfg_attr(not(debug_assertions), expect(unused_variables))]
-        let (stats, check_stats, comment_attachments) = if let Some(stats) = self.stats {
-            let attachments = if self.build_comment_attachments {
-                Some(if program.comments.is_empty() {
-                    CommentAttachments::empty(stats.nodes as usize)
-                } else {
-                    CommentAttachmentBuilder::build(program)
-                })
-            } else {
-                None
-            };
-            (stats, None, attachments)
-        } else if self.build_comment_attachments && !program.comments.is_empty() {
-            let (stats, attachments) = Stats::count_with_comment_attachments(program);
-            let stats_with_excess = stats.increase_by(self.excess_capacity);
-            (stats_with_excess, Some(stats), Some(attachments))
+        let (stats, check_stats) = if let Some(stats) = self.stats {
+            (stats, None)
         } else {
             let stats = Stats::count(program);
-            let attachments = self
-                .build_comment_attachments
-                .then(|| CommentAttachments::empty(stats.nodes as usize));
             let stats_with_excess = stats.increase_by(self.excess_capacity);
-            (stats_with_excess, Some(stats), attachments)
+            (stats_with_excess, Some(stats))
         };
         self.node_store.reserve(stats.nodes as usize);
         self.scoping.reserve(
@@ -406,6 +396,14 @@ impl<'a> SemanticBuilder<'a> {
         self.unused_labels.assert_empty();
 
         let node_count = self.node_store.node_count();
+        let comment_attachments = if self.build_comment_attachments {
+            Some(self.comment_attachment_collector.map_or_else(
+                || CommentAttachments::empty(node_count as usize),
+                CommentAttachmentCollector::finish,
+            ))
+        } else {
+            None
+        };
         let semantic = Semantic {
             source_text: self.source_text,
             source_type: self.source_type,
@@ -477,6 +475,9 @@ impl<'a> SemanticBuilder<'a> {
         // 1. Standalone node-id increment.
         let node_id = self.node_store.alloc_node_id();
         kind.set_node_id(node_id);
+        if let Some(collector) = &mut self.comment_attachment_collector {
+            collector.enter_node(kind);
+        }
         let parent_node_id = self.node_store.current_node_id;
         self.node_store.current_node_id = node_id;
 
@@ -902,6 +903,9 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
     )]
     #[inline(always)]
     fn leave_node(&mut self, kind: AstKind<'a>) {
+        if let Some(collector) = &mut self.comment_attachment_collector {
+            collector.leave_node(kind);
+        }
         if self.check_syntax_error {
             checker::check(kind, self);
         }
@@ -928,6 +932,9 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         let node_id = self.node_store.alloc_node_id();
         debug_assert_eq!(node_id, NodeId::ROOT);
         kind.set_node_id(node_id);
+        if let Some(collector) = &mut self.comment_attachment_collector {
+            collector.enter_node(kind);
+        }
         self.node_store.current_node_id = node_id;
         // 2 & 3. Either the full node store or the ancestry stack — never both.
         #[cfg(feature = "cfg")]
